@@ -2,7 +2,10 @@ module github.com/hellof20/pwm-gcp-genai
 
 go 1.23.1
 
-require cloud.google.com/go/vertexai v0.13.3
+require (
+	cloud.google.com/go/vertexai v0.13.3
+	golang.org/x/oauth2 v0.24.0
+)
 
 require (
 	cloud.google.com/go v0.116.0 // indirect
@@ -25,7 +28,6 @@ require (
 	go.opentelemetry.io/otel/trace v1.29.0 // indirect
 	golang.org/x/crypto v0.31.0 // indirect
 	golang.org/x/net v0.33.0 // indirect
-	golang.org/x/oauth2 v0.24.0 // indirect
 	golang.org/x/sync v0.10.0 // indirect
 	golang.org/x/sys v0.28.0 // indirect
 	golang.org/x/text v0.21.0 // indirect

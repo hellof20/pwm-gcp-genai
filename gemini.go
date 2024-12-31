@@ -124,7 +124,7 @@ func (a *GeminiAPI) InvokeText(prompt string) (string, error) {
 	return resultStr, nil
 }
 
-func (a *GeminiAPI) InvokeImage(prompt string, img_paths []string) (string, error) {
+func (a *GeminiAPI) InvokeImages(prompt string, img_paths []string) (string, error) {
 	ctx := context.Background()
 
 	// 初始化客户端
