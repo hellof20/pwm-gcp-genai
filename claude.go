@@ -2,10 +2,14 @@ package genai
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -14,38 +18,26 @@ import (
 	"golang.org/x/oauth2/google"
 )
 
-type ClaudeAPI struct {
-	location  string
-	projectID string
-	model     string
-	temp      float32
-	token     *oauth2.Token
-	tokenMtx  sync.Mutex
-}
+const (
+	anthropicVersion = "vertex-2023-10-16"
+	contentType      = "application/json; charset=utf-8"
+	apiURLFormat     = "https://%v-aiplatform.googleapis.com/v1/projects/%v/locations/%v/publishers/anthropic/models/%v:rawPredict"
+)
 
-// NewAPI 创建 API 实例
-func NewClaudeAPI(location, projectID, model string, temp float32) *ClaudeAPI {
-	return &ClaudeAPI{
-		location:  location,
-		model:     model,
-		projectID: projectID,
-		temp:      temp,
-	}
-}
+type Contents interface{}
 
-// Message 定义消息结构
 type Message struct {
-	Role     string        `json:"role"`
-	Contents []interface{} `json:"contents"`
+	Role     string     `json:"role"`
+	Contents []Contents `json:"contents"`
 }
 
 // MessageText 定义文本消息结构
-type MessageText struct {
+type ContentText struct {
 	Type string `json:"type"`
 	Text string `json:"text"`
 }
 
-type MessageImage struct {
+type ContentImage struct {
 	Type   string      `json:"type"`
 	Source ImageSource `json:"source"`
 }
@@ -61,23 +53,132 @@ type ClaudeRequest struct {
 	AnthropicVersion string                   `json:"anthropic_version"`
 	Messages         []map[string]interface{} `json:"messages"`
 	System           string                   `json:"system,omitempty"`
-	Temperature      float64                  `json:"temperature"`
+	Temperature      float32                  `json:"temperature"`
 	MaxTokens        int                      `json:"max_tokens"`
-	TopP             float64                  `json:"top_p"`
+	TopP             float32                  `json:"top_p"`
 	TopK             int                      `json:"top_k"`
 }
 
 // ClaudeResponse 定义响应结构
 type ClaudeResponse struct {
-	Content []interface{} `json:"content"`
+	Content []map[string]interface{} `json:"content"`
+}
+
+type ClaudeAPI struct {
+	Location    string
+	ProjectID   string
+	Model       string
+	Temperature float32
+	Token       *oauth2.Token
+	TokenMtx    sync.Mutex
+	MaxRetries  int
+	RetryDelay  time.Duration
+	httpClient  *http.Client // 复用 http client
+}
+
+// NewAPI 创建 API 实例
+func NewClaudeAPI(location, projectID, model string, temp float32, maxRetries int, retryDelay time.Duration) *ClaudeAPI {
+	api := &ClaudeAPI{
+		Location:    location,
+		Model:       model,
+		ProjectID:   projectID,
+		Temperature: temp,
+		MaxRetries:  maxRetries,
+		RetryDelay:  retryDelay,
+	}
+	api.initHttpClient()
+	return api
+}
+
+func (a *ClaudeAPI) initHttpClient() {
+	if a.httpClient == nil {
+		a.httpClient = &http.Client{
+			Timeout: 60 * time.Second, // 设置超时时间
+		}
+	}
+}
+
+func (a *ClaudeAPI) buildMessages(prompts []string, img_paths []string) ([]*Message, error) {
+	var messages []*Message
+	var contents []Contents
+	for _, prompt := range prompts {
+		contents = append(contents, &ContentText{
+			Type: "text",
+			Text: prompt,
+		})
+	}
+
+	for _, img_path := range img_paths {
+		bytes, err := os.ReadFile(img_path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read image file %s: %w", img_path, err)
+		}
+		contents = append(contents, &ContentImage{
+			Type: "image",
+			Source: ImageSource{
+				Type:      "base64",
+				MediaType: "image/jpeg",
+				Data:      base64.StdEncoding.EncodeToString(bytes),
+			},
+		})
+	}
+
+	messages = append(messages, &Message{
+		Role:     "user",
+		Contents: contents,
+	})
+	return messages, nil
+}
+
+func (a *ClaudeAPI) Invoke(prompts []string, img_paths []string) (string, error) {
+	messages, err := a.buildMessages(prompts, img_paths)
+	if err != nil {
+		return "", err
+	}
+
+	resp, err := a.invokeMessages(messages)
+	if err != nil {
+		return "", err
+	}
+
+	return resp, nil
 }
 
 // CluadeInvokeMessages 调用 Claude API
-func (a *ClaudeAPI) InvokeMessages(messages []*Message) (string, error) {
+func (a *ClaudeAPI) invokeMessages(messages []*Message) (string, error) {
+	request, err := a.buildClaudeRequest(messages)
+	if err != nil {
+		return "", fmt.Errorf("failed to build request: %w", err)
+	}
 
+	payloadBytes, err := json.Marshal(request)
+	if err != nil {
+		return "", fmt.Errorf("failed to marshal request: %w", err)
+	}
+
+	output, err := a.callClaudeModel(payloadBytes)
+	if err != nil {
+		return "", fmt.Errorf("failed to call claude model: %w", err)
+	}
+
+	var resp ClaudeResponse
+	if err := json.Unmarshal(output, &resp); err != nil {
+		return "", fmt.Errorf("failed to unmarshal response: %w", err)
+	}
+
+	contentStr, err := a.parseResponseContent(resp)
+
+	if err != nil {
+		return "", fmt.Errorf("failed to parse response content: %w", err)
+	}
+
+	return contentStr, nil
+}
+
+func (a *ClaudeAPI) buildClaudeRequest(messages []*Message) (ClaudeRequest, error) {
 	request := ClaudeRequest{
-		AnthropicVersion: "vertex-2023-10-16",
-		Temperature:      float64(a.temp),
+		AnthropicVersion: anthropicVersion,
+		Temperature:      a.Temperature,
 		MaxTokens:        1024,
 		TopP:             0.95,
 		TopK:             40,
@@ -85,12 +186,11 @@ func (a *ClaudeAPI) InvokeMessages(messages []*Message) (string, error) {
 
 	for _, msg := range messages {
 		if msg.Role == "system" {
-			for _, content := range msg.Contents {
-				switch v := content.(type) {
-				case *MessageText:
-					request.System = v.Text
-				}
+			systemText, err := a.extractSystemText(msg.Contents)
+			if err != nil {
+				return ClaudeRequest{}, err
 			}
+			request.System = systemText
 			continue
 		}
 
@@ -99,30 +199,27 @@ func (a *ClaudeAPI) InvokeMessages(messages []*Message) (string, error) {
 			"content": msg.Contents,
 		})
 	}
+	return request, nil
+}
 
-	payloadBytes, err := json.Marshal(request)
-	if err != nil {
-		return "", err
+func (a *ClaudeAPI) extractSystemText(contents []Contents) (string, error) {
+	for _, content := range contents {
+		if textContent, ok := content.(*ContentText); ok {
+			return textContent.Text, nil
+		}
 	}
+	return "", fmt.Errorf("system message must contain text content")
+}
 
-	output, err := a.callClaudeModel(payloadBytes)
-	if err != nil {
-		return "", err
-	}
-
-	var resp ClaudeResponse
-	err = json.Unmarshal(output, &resp)
-	if err != nil {
-		return "", err
-	}
-
+func (a *ClaudeAPI) parseResponseContent(resp ClaudeResponse) (string, error) {
 	var contents []string
 	for _, v := range resp.Content {
-		switch vv := v.(type) {
-		case map[string]interface{}:
-			if vv["type"] == "text" {
-				contents = append(contents, vv["text"].(string))
+		if v["type"] == "text" {
+			text, ok := v["text"].(string)
+			if !ok {
+				return "", errors.New("invalid text content format")
 			}
+			contents = append(contents, text)
 		}
 	}
 
@@ -131,48 +228,64 @@ func (a *ClaudeAPI) InvokeMessages(messages []*Message) (string, error) {
 
 // callClaudeModel 调用 Claude 模型
 func (a *ClaudeAPI) callClaudeModel(payloadBytes []byte) ([]byte, error) {
+	var body []byte
+	var err error
+	for i := 0; i <= a.MaxRetries; i++ {
+		body, err = a.callClaudeModelInternal(payloadBytes)
+		if err == nil {
+			return body, nil
+		}
+		if i == a.MaxRetries {
+			return nil, fmt.Errorf("failed after %d retries: %w", a.MaxRetries, err)
+		}
+		time.Sleep(a.RetryDelay * time.Duration(math.Pow(2, float64(i)))) // 指数退避
+	}
+	return nil, errors.New("unreachable")
+
+}
+
+func (a *ClaudeAPI) callClaudeModelInternal(payloadBytes []byte) ([]byte, error) {
 	token, err := a.getAccessToken()
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to get access token: %w", err)
 	}
 
-	apiURL := fmt.Sprintf("https://%v-aiplatform.googleapis.com/v1/projects/%v/locations/%v/publishers/anthropic/models/%v:rawPredict", a.location, a.projectID, a.location, a.model)
+	apiURL := fmt.Sprintf(apiURLFormat, a.Location, a.ProjectID, a.Location, a.Model)
 
-	request, err := http.NewRequestWithContext(context.Background(), "POST", apiURL, strings.NewReader(string(payloadBytes)))
+	request, err := http.NewRequestWithContext(context.Background(), http.MethodPost, apiURL, strings.NewReader(string(payloadBytes)))
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
+
 	request.Header.Set("Authorization", "Bearer "+token)
-	request.Header.Set("Content-Type", "application/json; charset=utf-8")
+	request.Header.Set("Content-Type", contentType)
 
-	client := http.Client{}
-	response, err := client.Do(request)
+	response, err := a.httpClient.Do(request)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("http request failed: %w", err)
 	}
-
 	defer response.Body.Close()
 
-	if response.StatusCode == http.StatusOK {
-		body, err := io.ReadAll(response.Body)
-		if err != nil {
-			return nil, err
-		}
-
-		return body, nil
+	body, err := io.ReadAll(response.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response body: %w", err)
 	}
 
-	return nil, fmt.Errorf("unexpected status code: %d", response.StatusCode)
+	if response.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("unexpected status code: %d, response body: %s", response.StatusCode, string(body))
+	}
+
+	return body, nil
 }
 
 // getAccessToken 获取 Google Cloud OAuth token
 func (a *ClaudeAPI) getAccessToken() (string, error) {
-	a.tokenMtx.Lock()
-	defer a.tokenMtx.Unlock()
+	a.TokenMtx.Lock()
+	defer a.TokenMtx.Unlock()
 
 	// 如果令牌存在且未过期，则直接返回
-	if a.token != nil && !a.token.Expiry.Before(time.Now()) {
-		return a.token.AccessToken, nil
+	if a.Token != nil && !a.Token.Expiry.Before(time.Now()) {
+		return a.Token.AccessToken, nil
 	}
 
 	creds, err := google.FindDefaultCredentials(context.Background(), "https://www.googleapis.com/auth/cloud-platform")
@@ -185,7 +298,7 @@ func (a *ClaudeAPI) getAccessToken() (string, error) {
 		return "", err
 	}
 
-	a.token = token
+	a.Token = token
 
 	return token.AccessToken, nil
 }
