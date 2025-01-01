@@ -10,6 +10,7 @@ import (
 	"math"
 	"net/http"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
@@ -113,11 +114,21 @@ func (a *ClaudeAPI) buildMessages(prompts []string, img_paths []string) ([]*Mess
 		if err != nil {
 			return nil, fmt.Errorf("failed to read image file %s: %w", img_path, err)
 		}
+
+		// 根据文件扩展名推断MIME类型
+		mimeType := "image/jpeg" // 默认 JPEG
+		ext := filepath.Ext(img_path)
+		if ext == ".png" {
+			mimeType = "image/png"
+		} else if ext == ".webp" {
+			mimeType = "image/webp"
+		}
+
 		contents = append(contents, &ContentImage{
 			Type: "image",
 			Source: ImageSource{
 				Type:      "base64",
-				MediaType: "image/jpeg",
+				MediaType: mimeType,
 				Data:      base64.StdEncoding.EncodeToString(bytes),
 			},
 		})
