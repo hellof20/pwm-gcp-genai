@@ -4,6 +4,7 @@ go 1.23.1
 
 require (
 	cloud.google.com/go/vertexai v0.13.3
+	github.com/google/uuid v1.6.0
 	golang.org/x/oauth2 v0.24.0
 )
 

@@ -3,12 +3,18 @@ package genai
 import (
 	"context"
 	"fmt"
+	"io"
 	"math"
+	"mime"
+	"net/http"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strings"
 	"time"
 
 	"cloud.google.com/go/vertexai/genai"
+	"github.com/google/uuid"
 )
 
 type GeminiAPI struct {
@@ -70,7 +76,61 @@ func (a *GeminiAPI) retryableGenerateContent(ctx context.Context, model *genai.G
 	return resp, nil
 }
 
-func (a *GeminiAPI) Invoke(prompts []string, img_paths []string) (string, error) {
+// 定义一个接口，用于表示各种输入类型
+type Input interface {
+	ToPart() (genai.Part, error)
+}
+
+// 实现文本输入
+type TextInput struct {
+	Text string
+}
+
+func (t TextInput) ToPart() (genai.Part, error) {
+	return genai.Text(t.Text), nil
+}
+
+// 实现其他模态输入
+type BlobInput struct {
+	Path string
+}
+
+func (b BlobInput) ToPart() (genai.Part, error) {
+	if strings.HasPrefix(b.Path, "gs://") {
+		// 如果是 GCS 路径，使用 genai.FileData
+		return genai.FileData{
+			MIMEType: mime.TypeByExtension(filepath.Ext(b.Path)),
+			FileURI:  b.Path,
+		}, nil
+	} else if strings.HasPrefix(b.Path, "http://") || strings.HasPrefix(b.Path, "https://") {
+		// 如果是 HTTP/HTTPS 路径，下载文件并转换为 Blob
+		tmpFile, err := downloadFile(b.Path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to download file: %w", err)
+		}
+		defer os.Remove(tmpFile) // 确保函数退出时删除临时文件
+		data, err := os.ReadFile(tmpFile)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read downloaded file: %w", err)
+		}
+		return genai.Blob{
+			MIMEType: mime.TypeByExtension(filepath.Ext(b.Path)),
+			Data:     data,
+		}, nil
+	} else {
+		// 如果是本地路径，使用 genai.Blob
+		data, err := os.ReadFile(b.Path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to read file: %w", err)
+		}
+		return genai.Blob{
+			MIMEType: mime.TypeByExtension(filepath.Ext(b.Path)),
+			Data:     data,
+		}, nil
+	}
+}
+
+func (a *GeminiAPI) Invoke(inputs ...Input) (string, error) {
 	ctx, cancelFn := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancelFn()
 
@@ -85,33 +145,17 @@ func (a *GeminiAPI) Invoke(prompts []string, img_paths []string) (string, error)
 	client.GenerationConfig.ResponseMIMEType = a.ResponseMIMEType
 	client.GenerationConfig.ResponseSchema = a.ResponseSchema
 
-	var parts []genai.Part // 使用 parts 切片来存储所有的输入
-
-	// 添加文本 prompt
-	for _, prompt := range prompts {
-		parts = append(parts, genai.Text(prompt))
-	}
-
-	// 添加图片 prompt
-	for _, img_path := range img_paths {
-		bytes, err := os.ReadFile(img_path)
+	var parts []genai.Part
+	// 处理可变参数 inputs
+	for _, input := range inputs {
+		part, err := input.ToPart()
 		if err != nil {
-			return "", fmt.Errorf("failed to read image file %s: %w", img_path, err)
+			return "", err
 		}
-
-		// 根据文件扩展名推断MIME类型
-		mimeType := "image/jpeg" // 默认 JPEG
-		ext := filepath.Ext(img_path)
-		if ext == ".png" {
-			mimeType = "image/png"
-		} else if ext == ".webp" {
-			mimeType = "image/webp"
-		}
-		img_data := genai.ImageData(mimeType, bytes)
-		parts = append(parts, img_data) // 添加图片数据到 parts 切片
+		parts = append(parts, part)
 	}
 
-	resp, err := a.retryableGenerateContent(ctx, client, parts...) // 使用 ... 展开 parts 切片
+	resp, err := a.retryableGenerateContent(ctx, client, parts...)
 	if err != nil {
 		return "", fmt.Errorf("failed to generate content: %w", err)
 	}
@@ -123,4 +167,46 @@ func (a *GeminiAPI) Invoke(prompts []string, img_paths []string) (string, error)
 	result := resp.Candidates[0].Content.Parts[0]
 	resultStr := fmt.Sprint(result)
 	return resultStr, nil
+}
+
+// downloadFile downloads a file from a given URL and returns the local path
+func downloadFile(urlStr string) (string, error) {
+	parsedURL, err := url.Parse(urlStr)
+	if err != nil {
+		return "", fmt.Errorf("failed to parse URL: %w", err)
+	}
+	// 获取URL路径部分，并从中提取出文件名
+	urlPath := parsedURL.Path
+	fileExtension := filepath.Ext(urlPath)
+	if fileExtension == "" {
+		fileExtension = ".tmp"
+	}
+	fileName := uuid.New().String() + fileExtension
+
+	// 创建临时文件
+	tmpFile, err := os.CreateTemp("", fileName)
+	if err != nil {
+		return "", fmt.Errorf("failed to create temp file: %w", err)
+	}
+	defer tmpFile.Close()
+
+	resp, err := http.Get(urlStr)
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to download file: %w", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to download file: status code %d", resp.StatusCode)
+	}
+
+	_, err = io.Copy(tmpFile, resp.Body)
+	if err != nil {
+		os.Remove(tmpFile.Name())
+		return "", fmt.Errorf("failed to write to temp file: %w", err)
+	}
+
+	return tmpFile.Name(), nil
 }
