@@ -144,6 +144,24 @@ func (a *GeminiAPI) Invoke(inputs ...Input) (string, error) {
 	client.SetTemperature(a.Temperature)
 	client.GenerationConfig.ResponseMIMEType = a.ResponseMIMEType
 	client.GenerationConfig.ResponseSchema = a.ResponseSchema
+	client.SafetySettings = []*genai.SafetySetting{
+		{
+			Category:  genai.HarmCategoryHarassment,
+			Threshold: genai.HarmBlockNone,
+		},
+		{
+			Category:  genai.HarmCategoryHateSpeech,
+			Threshold: genai.HarmBlockNone,
+		},
+		{
+			Category:  genai.HarmCategorySexuallyExplicit,
+			Threshold: genai.HarmBlockNone,
+		},
+		{
+			Category:  genai.HarmCategoryDangerousContent,
+			Threshold: genai.HarmBlockNone,
+		},
+	}
 
 	var parts []genai.Part
 	// 处理可变参数 inputs
