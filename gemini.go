@@ -13,6 +13,7 @@ import (
 	"strings"
 	"time"
 
+	"cloud.google.com/go/storage"
 	"cloud.google.com/go/vertexai/genai"
 )
 
@@ -96,9 +97,14 @@ type BlobInput struct {
 
 func (b BlobInput) ToPart() (genai.Part, error) {
 	if strings.HasPrefix(b.Path, "gs://") {
+		ctx := context.Background()
+		mimeType, err := getGCSFileMimeTypeFromMetadata(ctx, b.Path)
+		if err != nil {
+			return nil, fmt.Errorf("failed to get GCS file mime type: %w", err)
+		}
 		// 如果是 GCS 路径，使用 genai.FileData
 		return genai.FileData{
-			MIMEType: mime.TypeByExtension(filepath.Ext(b.Path)),
+			MIMEType: mimeType,
 			FileURI:  b.Path,
 		}, nil
 	} else if strings.HasPrefix(b.Path, "http://") || strings.HasPrefix(b.Path, "https://") {
@@ -138,7 +144,7 @@ func (b BlobInput) ToPart() (genai.Part, error) {
 }
 
 func (a *GeminiAPI) Invoke(inputs ...Input) (string, error) {
-	ctx, cancelFn := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancelFn := context.WithTimeout(context.Background(), 120*time.Second)
 	defer cancelFn()
 
 	// 初始化客户端
@@ -221,4 +227,34 @@ func downloadFile(urlStr string) (string, error) {
 		return "", err
 	}
 	return tmpFile.Name(), nil
+}
+
+func getGCSFileMimeTypeFromMetadata(ctx context.Context, gcsPath string) (string, error) {
+	// Parse the GCS path
+	u, err := url.Parse(gcsPath)
+	if err != nil {
+		return "", fmt.Errorf("invalid GCS path: %w", err)
+	}
+	if u.Scheme != "gs" {
+		return "", fmt.Errorf("invalid GCS scheme: %s", u.Scheme)
+	}
+	bucketName := u.Host
+	objectName := strings.TrimPrefix(u.Path, "/")
+
+	client, err := storage.NewClient(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to create GCS client: %w", err)
+	}
+	defer client.Close()
+
+	obj := client.Bucket(bucketName).Object(objectName)
+	attrs, err := obj.Attrs(ctx)
+	if err != nil {
+		return "", fmt.Errorf("failed to get GCS object attributes: %w", err)
+	}
+	mimeType := attrs.ContentType
+	if mimeType == "" { // fallback to extension
+		mimeType = mime.TypeByExtension(filepath.Ext(objectName))
+	}
+	return mimeType, nil
 }

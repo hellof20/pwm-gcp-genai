@@ -2,6 +2,6 @@
     "go.testFlags": [
         "-v",
         "-count=1",
-        "-timeout=1m"
+        "-timeout=2m"
     ]
 }
