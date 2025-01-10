@@ -14,7 +14,6 @@ import (
 	"time"
 
 	"cloud.google.com/go/vertexai/genai"
-	"github.com/google/uuid"
 )
 
 type GeminiAPI struct {
@@ -113,8 +112,12 @@ func (b BlobInput) ToPart() (genai.Part, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read downloaded file: %w", err)
 		}
+		mimeType := http.DetectContentType(data)
+		if mimeType == "application/octet-stream" { // fallback to extension
+			mimeType = mime.TypeByExtension(filepath.Ext(b.Path))
+		}
 		return genai.Blob{
-			MIMEType: mime.TypeByExtension(filepath.Ext(b.Path)),
+			MIMEType: mimeType,
 			Data:     data,
 		}, nil
 	} else {
@@ -123,8 +126,12 @@ func (b BlobInput) ToPart() (genai.Part, error) {
 		if err != nil {
 			return nil, fmt.Errorf("failed to read file: %w", err)
 		}
+		mimeType := http.DetectContentType(data)
+		if mimeType == "application/octet-stream" { // fallback to extension
+			mimeType = mime.TypeByExtension(filepath.Ext(b.Path))
+		}
 		return genai.Blob{
-			MIMEType: mime.TypeByExtension(filepath.Ext(b.Path)),
+			MIMEType: mimeType,
 			Data:     data,
 		}, nil
 	}
@@ -187,44 +194,31 @@ func (a *GeminiAPI) Invoke(inputs ...Input) (string, error) {
 	return resultStr, nil
 }
 
-// downloadFile downloads a file from a given URL and returns the local path
 func downloadFile(urlStr string) (string, error) {
 	parsedURL, err := url.Parse(urlStr)
 	if err != nil {
-		return "", fmt.Errorf("failed to parse URL: %w", err)
+		return "", fmt.Errorf("invalid URL: %w", err)
 	}
-	// 获取URL路径部分，并从中提取出文件名
-	urlPath := parsedURL.Path
-	fileExtension := filepath.Ext(urlPath)
-	if fileExtension == "" {
-		fileExtension = ".tmp"
-	}
-	fileName := uuid.New().String() + fileExtension
-
-	// 创建临时文件
-	tmpFile, err := os.CreateTemp("", fileName)
-	if err != nil {
-		return "", fmt.Errorf("failed to create temp file: %w", err)
-	}
-	defer tmpFile.Close()
-
 	resp, err := http.Get(urlStr)
 	if err != nil {
-		os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("failed to download file: %w", err)
+		return "", err
 	}
 	defer resp.Body.Close()
 
-	if resp.StatusCode != http.StatusOK {
-		os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("failed to download file: status code %d", resp.StatusCode)
+	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
+		return "", fmt.Errorf("failed to download file, status code: %d", resp.StatusCode)
 	}
+
+	tmpFile, err := os.CreateTemp("", filepath.Base(parsedURL.Path)) // 使用原始文件名创建临时文件
+	if err != nil {
+		return "", err
+	}
+	defer tmpFile.Close()
 
 	_, err = io.Copy(tmpFile, resp.Body)
 	if err != nil {
 		os.Remove(tmpFile.Name())
-		return "", fmt.Errorf("failed to write to temp file: %w", err)
+		return "", err
 	}
-
 	return tmpFile.Name(), nil
 }
