@@ -144,7 +144,7 @@ func (b BlobInput) ToPart() (genai.Part, error) {
 }
 
 func (a *GeminiAPI) Invoke(inputs ...Input) (string, error) {
-	ctx, cancelFn := context.WithTimeout(context.Background(), 120*time.Second)
+	ctx, cancelFn := context.WithTimeout(context.Background(), 180*time.Second)
 	defer cancelFn()
 
 	// 初始化客户端
