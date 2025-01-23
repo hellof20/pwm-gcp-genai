@@ -65,7 +65,7 @@ func (a *GeminiAPI) retryableGenerateContent(ctx context.Context, model *genai.G
 		}
 		if retry < a.MaxRetries {
 			delay := a.RetryDelay * time.Duration(math.Pow(2, float64(retry))) // 指数退避
-			fmt.Printf("Retrying after %v, attempt %d/%d, error: %v\n", delay, retry+1, a.MaxRetries+1, err)
+			fmt.Printf("Retrying after %v, attempt %d/%d, error: %v\n", delay, retry+1, a.MaxRetries, err)
 			time.Sleep(delay)
 			continue
 		} else {
